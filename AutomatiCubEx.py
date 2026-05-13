@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -224,6 +225,7 @@ class CubeViewer(QMainWindow):
 
         self.cubex_root = None
         self.registry_table_path = None
+        self.analysis_name = None
 
         self.loaded_files = {}
 
@@ -490,8 +492,85 @@ class CubeViewer(QMainWindow):
         if not path.lower().endswith(".csv"):
             path += ".csv"
 
+        analysis_name = self.ask_analysis_name(path)
+        if not analysis_name:
+            return
+
         self.registry_table_path = path
-        self.table_label.setText(f"Action table: {path}")
+        self.analysis_name = analysis_name
+        self.table_label.setText(f"Action table: {path}\nAnalysis: {analysis_name}")
+
+    def get_existing_analysis_names(self, table_path):
+        """Read existing analysis names from the CSV registry, if any.
+
+        Older versions of AutomatiCubEx used CubeName as the row identifier.
+        When such tables are opened, those names are offered as possible
+        analysis names so the user can continue an old workflow instead of
+        creating a duplicated row.
+        """
+        import csv
+
+        if not os.path.exists(table_path):
+            return []
+
+        names = []
+
+        try:
+            with open(table_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = row.get("AnalysisName", "").strip()
+                    if not name:
+                        name = row.get("CubeName", "").strip()
+                    if name and name not in names:
+                        names.append(name)
+        except Exception:
+            return []
+
+        return names
+
+    def ask_analysis_name(self, table_path):
+        """Ask which analysis row should receive all future action parameters."""
+        existing_names = self.get_existing_analysis_names(table_path)
+
+        if existing_names:
+            default_name = self.analysis_name if self.analysis_name in existing_names else existing_names[0]
+            current_index = existing_names.index(default_name)
+
+            name, ok = QInputDialog.getItem(
+                self,
+                "Analysis name",
+                "Select an existing analysis name or type a new one:",
+                existing_names,
+                current_index,
+                True,
+            )
+        else:
+            suggested = ""
+            if self.cube_path:
+                suggested = os.path.splitext(os.path.basename(self.cube_path))[0]
+
+            name, ok = QInputDialog.getText(
+                self,
+                "Analysis name",
+                "Write the analysis name for this workflow:",
+                text=suggested,
+            )
+
+        if not ok:
+            return None
+
+        name = str(name).strip()
+
+        if not name:
+            QMessageBox.warning(
+                self,
+                "Missing analysis name",
+                "Please provide an analysis name before saving action parameters.",
+            )
+            return None
+
+        return name
 
     def open_cube(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1417,17 +1496,42 @@ class CubeViewer(QMainWindow):
         if self.registry_table_path is None:
             return
 
+        if not self.analysis_name:
+            analysis_name = self.ask_analysis_name(self.registry_table_path)
+            if not analysis_name:
+                return
+            self.analysis_name = analysis_name
+            self.table_label.setText(
+                f"Action table: {self.registry_table_path}\nAnalysis: {self.analysis_name}"
+            )
+
         import csv
 
-        cube_name = os.path.splitext(os.path.basename(input_cube))[0]
+        input_cube = input_cube or ""
+        output_cube = output_cube or ""
+        analysis_name = self.analysis_name
+        cube_name = os.path.splitext(os.path.basename(input_cube))[0] if input_cube else ""
 
+        # One row corresponds to one full scientific workflow, not to one FITS file.
+        # Each action updates the same row identified by AnalysisName, so parameters
+        # from Cube2Im, PSF subtraction, CubEx, CreateMaps, etc. remain together.
         row_dict = {
-            "CubeName": cube_name,
-            "CubePath": input_cube,
+            "AnalysisName": analysis_name,
+            "LastInput": input_cube,
             "LastAction": action_name,
-            "LastOutput": output_cube or "",
+            "LastOutput": output_cube,
             "LastCommand": command or "",
+            safe_column_name(f"{action_name}_Input"): input_cube,
+            safe_column_name(f"{action_name}_Output"): output_cube,
+            safe_column_name(f"{action_name}_Command"): command or "",
         }
+
+        # Keep these legacy/common columns useful, but they are no longer used
+        # as the row key. The row key is AnalysisName only.
+        if cube_name:
+            row_dict["CubeName"] = cube_name
+        if input_cube:
+            row_dict["CubePath"] = input_cube
 
         for key, value in params.items():
             col = safe_column_name(f"{action_name}_{key}")
@@ -1449,7 +1553,15 @@ class CubeViewer(QMainWindow):
         found = False
 
         for row in rows:
-            if row.get("CubeName", "") == cube_name:
+            row_analysis_name = row.get("AnalysisName", "").strip()
+
+            # Backward compatibility: old tables may not have AnalysisName yet.
+            # In that case, allow matching against CubeName once and then upgrade
+            # the row by writing AnalysisName.
+            if not row_analysis_name:
+                row_analysis_name = row.get("CubeName", "").strip()
+
+            if row_analysis_name == analysis_name:
                 row.update(row_dict)
                 found = True
                 break
