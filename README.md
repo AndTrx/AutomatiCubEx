@@ -1107,3 +1107,10 @@ The current GUI already supports a reproducible extended-emission workflow. Usef
 - adding automatic computation of vzero from line name and redshift;
 - adding a final FITS/CSV master table of measured nebular quantities.
 
+
+## Documentation
+
+A complete visual step-by-step guide is available here:
+
+[AutomatiCubEx Visual Guide](docs/AutomatiCubEx_visual_guide.pdf)
+
