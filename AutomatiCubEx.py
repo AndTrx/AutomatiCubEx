@@ -5,7 +5,7 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
-from matplotlib.colors import LogNorm
+from matplotlib.colors import LogNorm, Normalize
 import shutil
 
 from PySide6.QtCore import Qt
@@ -137,7 +137,7 @@ CUBEX_ACTIONS = {
         "special": True,
         "params": {
             "mask3d": "",
-            "selected_id": "",
+            "selected_ids": "",
         },
     },
 
@@ -210,6 +210,7 @@ class CubeViewer(QMainWindow):
         self.cube = None
         self.header = None
         self.cube_path = None
+        self.data_is_image = False
         self.current_z = 0
         self.wave = None
 
@@ -231,6 +232,20 @@ class CubeViewer(QMainWindow):
         self.spectrum_xlim = None
         self.spectrum_ylim = None
 
+        # Display cuts for the image viewer.
+        # The user can either keep automatic cuts, set them manually, or adjust them
+        # with a DS9/QFitsView-like click-and-drag interaction on the image.
+        self.manual_image_cuts = False
+        self.image_cut_vmin = None
+        self.image_cut_vmax = None
+        self.image_colorbar = None
+        self.interactive_cuts_mode = False
+        self._cut_dragging = False
+        self._cut_start_x = None
+        self._cut_start_y = None
+        self._cut_start_log_vmin = None
+        self._cut_start_log_vmax = None
+
         self._updating_image_limits = False
         self._updating_spectrum_limits = False
 
@@ -246,7 +261,7 @@ class CubeViewer(QMainWindow):
         right_panel_layout = QVBoxLayout(right_panel)
         right_panel.setFixedWidth(340)
 
-        self.open_button = QPushButton("Load FITS cube")
+        self.open_button = QPushButton("Load FITS image/cube")
         self.open_button.clicked.connect(self.open_cube)
 
         self.open_extra_button = QPushButton("Open another FITS")
@@ -269,7 +284,7 @@ class CubeViewer(QMainWindow):
 
         self.cubex_path_label = QLabel("CubEx path: not set")
         self.table_label = QLabel("Action table: not set")
-        self.info_label = QLabel("No cube loaded")
+        self.info_label = QLabel("No FITS image/cube loaded")
 
         self.load_progress = QProgressBar()
         self.load_progress.setRange(0, 100)
@@ -292,8 +307,20 @@ class CubeViewer(QMainWindow):
         self.image_fig = Figure(figsize=(9, 7), constrained_layout=True)
         self.image_canvas = FigureCanvas(self.image_fig)
         self.image_toolbar = NavigationToolbar(self.image_canvas, self)
+
+        self.cuts_button = QPushButton("Cuts OFF")
+        self.cuts_button.setFixedWidth(90)
+        self.cuts_button.setCheckable(True)
+        self.cuts_button.clicked.connect(self.toggle_interactive_cuts)
+
+        self.manual_cuts_button = QPushButton("Set cuts")
+        self.manual_cuts_button.setFixedWidth(90)
+        self.manual_cuts_button.clicked.connect(self.open_image_cuts_dialog)
+
         self.image_ax = self.image_fig.add_subplot(111)
         self.image_canvas.mpl_connect("button_press_event", self.on_image_click)
+        self.image_canvas.mpl_connect("motion_notify_event", self.on_image_motion)
+        self.image_canvas.mpl_connect("button_release_event", self.on_image_release)
 
         self.image_ax.callbacks.connect("xlim_changed", self.on_image_limits_changed)
         self.image_ax.callbacks.connect("ylim_changed", self.on_image_limits_changed)
@@ -331,7 +358,14 @@ class CubeViewer(QMainWindow):
         image_widget = QWidget()
         image_layout = QVBoxLayout(image_widget)
         image_layout.setContentsMargins(0, 0, 0, 0)
-        image_layout.addWidget(self.image_toolbar)
+
+        image_top_bar = QHBoxLayout()
+        image_top_bar.setContentsMargins(0, 0, 0, 0)
+        image_top_bar.addWidget(self.image_toolbar)
+        image_top_bar.addWidget(self.cuts_button)
+        image_top_bar.addWidget(self.manual_cuts_button)
+
+        image_layout.addLayout(image_top_bar)
         image_layout.addWidget(self.image_canvas)
 
         spectrum_widget = QWidget()
@@ -462,7 +496,7 @@ class CubeViewer(QMainWindow):
     def open_cube(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open FITS cube",
+            "Open FITS image or cube",
             "",
             "FITS files (*.fits *.fit *.fz)",
         )
@@ -552,22 +586,42 @@ class CubeViewer(QMainWindow):
         self.cube = None
         self.header = None
         self.cube_path = path
+        self.data_is_image = False
+
+        first_2d_data = None
+        first_2d_header = None
 
         with fits.open(path, memmap=True) as hdul:
             self.load_progress.setValue(25)
             QApplication.processEvents()
 
             for hdu in hdul:
-                if hdu.data is not None and hdu.data.ndim == 3:
+                if hdu.data is None:
+                    continue
+
+                if hdu.data.ndim == 3:
                     self.cube = np.asarray(hdu.data, dtype=float)
                     self.header = hdu.header
+                    self.data_is_image = False
                     break
+
+                if hdu.data.ndim == 2 and first_2d_data is None:
+                    first_2d_data = np.asarray(hdu.data, dtype=float)
+                    first_2d_header = hdu.header
 
         self.load_progress.setValue(80)
         QApplication.processEvents()
 
+        if self.cube is None and first_2d_data is not None:
+            # Keep the internal data layout as (z, y, x), even for images.
+            # This lets the image viewer reuse the same plotting code while
+            # the spectrum panel simply reports that no spectrum is available.
+            self.cube = first_2d_data[np.newaxis, :, :]
+            self.header = first_2d_header
+            self.data_is_image = True
+
         if self.cube is None:
-            self.info_label.setText("No 3D cube found")
+            self.info_label.setText("No 2D image or 3D cube found")
             self.load_progress.setValue(0)
             return
 
@@ -579,6 +633,9 @@ class CubeViewer(QMainWindow):
             self.image_ylim = None
             self.spectrum_xlim = None
             self.spectrum_ylim = None
+            self.manual_image_cuts = False
+            self.image_cut_vmin = None
+            self.image_cut_vmax = None
 
         nz, ny, nx = self.cube.shape
         self.compute_wavelength_axis()
@@ -589,10 +646,15 @@ class CubeViewer(QMainWindow):
         self.z_slider.setMinimum(0)
         self.z_slider.setMaximum(nz - 1)
         self.z_slider.setValue(self.current_z)
+        self.z_slider.setEnabled(not self.data_is_image)
         self.z_slider.blockSignals(False)
 
-        self.z_label.setText(f"z = {self.current_z}")
-        self.info_label.setText(f"{path} | shape = {nx} x {ny} x {nz}")
+        if self.data_is_image:
+            self.z_label.setText("image")
+            self.info_label.setText(f"{path} | 2D image shape = {nx} x {ny}")
+        else:
+            self.z_label.setText(f"z = {self.current_z}")
+            self.info_label.setText(f"{path} | cube shape = {nx} x {ny} x {nz}")
 
         self.update_image(keep_zoom=not reset_zoom)
         self.update_spectrum(keep_zoom=not reset_zoom)
@@ -601,7 +663,7 @@ class CubeViewer(QMainWindow):
         self.load_progress.setValue(100)
 
     def update_slice_from_slider(self):
-        if self.cube is None:
+        if self.cube is None or self.data_is_image:
             return
 
         self.current_z = self.z_slider.value()
@@ -648,7 +710,7 @@ class CubeViewer(QMainWindow):
         return self.cube[self.current_z, :, :]
 
     def compute_wavelength_axis(self):
-        if self.header is None or self.cube is None:
+        if self.header is None or self.cube is None or self.data_is_image:
             self.wave = None
             return
 
@@ -666,6 +728,9 @@ class CubeViewer(QMainWindow):
         self.wave = crval3 + (pix - crpix3) * cd3_3
 
     def get_current_lambda(self):
+        if self.data_is_image:
+            return None
+
         if self.wave is None:
             return None
 
@@ -673,6 +738,74 @@ class CubeViewer(QMainWindow):
             return None
 
         return float(self.wave[self.current_z])
+        
+    def estimate_vzero_from_mask(self, cube_path, mask_path, object_id=1):
+        """
+        Estimate the wavelength centroid of the emission inside a 3D mask.
+        This is used as a sensible default vzero for velocity maps.
+        """
+
+        with fits.open(cube_path) as hdul_cube, fits.open(mask_path) as hdul_mask:
+
+            cube = None
+            cube_header = None
+            mask = None
+
+            # Find first 3D science cube
+            for hdu in hdul_cube:
+                if hdu.data is not None and hdu.data.ndim == 3:
+                    cube = np.asarray(hdu.data, dtype=float)
+                    cube_header = hdu.header
+                    break
+
+            # Find first 3D mask cube
+            for hdu in hdul_mask:
+                if hdu.data is not None and hdu.data.ndim == 3:
+                    mask = np.asarray(hdu.data)
+                    break
+
+            if cube is None:
+                raise ValueError("No 3D science cube found.")
+
+            if mask is None:
+                raise ValueError("No 3D mask found.")
+
+            if cube.shape != mask.shape:
+                raise ValueError("Cube and mask have different shapes.")
+
+            nz = cube.shape[0]
+
+            crval3 = cube_header.get("CRVAL3", None)
+            cd3_3 = cube_header.get("CD3_3", cube_header.get("CDELT3", None))
+            crpix3 = cube_header.get("CRPIX3", 1.0)
+
+            if crval3 is None or cd3_3 is None:
+                raise ValueError(
+                    "Missing spectral WCS keywords (CRVAL3/CDELT3/CD3_3)."
+                )
+
+            pix = np.arange(nz, dtype=float) + 1.0
+
+            wave = crval3 + (pix - crpix3) * cd3_3
+
+            selected = mask == float(object_id)
+
+            flux_z = np.nansum(
+                np.where(selected, cube, 0.0),
+                axis=(1, 2),
+            )
+
+            good = np.isfinite(flux_z) & (flux_z > 0)
+
+            if not np.any(good):
+                raise ValueError("No positive flux found inside mask.")
+
+            vzero = (
+                np.nansum(wave[good] * flux_z[good])
+                / np.nansum(flux_z[good])
+            )
+
+            return float(vzero)
 
     def lambda_to_zpix(self, lam):
         if self.wave is None:
@@ -696,7 +829,7 @@ class CubeViewer(QMainWindow):
     def update_current_values_label(self):
         lam = self.get_current_lambda()
 
-        z_txt = str(self.current_z)
+        z_txt = "image" if self.data_is_image else str(self.current_z)
         lam_txt = "none" if lam is None else f"{lam:.3f}"
 
         if self.selected_x is None or self.selected_y is None:
@@ -709,6 +842,156 @@ class CubeViewer(QMainWindow):
         self.current_values_label.setText(
             f"Current values: z = {z_txt} | lambda = {lam_txt} | x = {x_txt} | y = {y_txt}"
         )
+
+    def get_auto_image_cuts(self, image):
+        """Return robust positive log cuts for the image currently displayed."""
+        finite_positive = np.isfinite(image) & (image > 0)
+
+        if not np.any(finite_positive):
+            return None, None
+
+        values = image[finite_positive]
+        vmax = np.nanmax(values)
+        vmin = np.nanmin(values)
+
+        if not np.isfinite(vmax) or vmax <= 0:
+            return None, None
+
+        if not np.isfinite(vmin) or vmin <= 0 or vmin >= vmax:
+            vmin = vmax * 1e-4
+
+        if vmin <= 0 or vmin >= vmax:
+            vmin = np.nanmin(values)
+
+        return float(vmin), float(vmax)
+
+    def get_current_display_cuts(self):
+        """Return the cuts currently used by the image viewer."""
+        image = self.get_current_image()
+
+        if image is None:
+            return None, None
+
+        if self.manual_image_cuts and self.image_cut_vmin is not None and self.image_cut_vmax is not None:
+            vmin = self.image_cut_vmin
+            vmax = self.image_cut_vmax
+        else:
+            vmin, vmax = self.get_auto_image_cuts(image)
+
+        if vmin is None or vmax is None:
+            return None, None
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            return None, None
+
+        return float(vmin), float(vmax)
+
+    def toggle_interactive_cuts(self):
+        """Enable or disable DS9/QFitsView-like click-and-drag cuts."""
+        self.interactive_cuts_mode = self.cuts_button.isChecked()
+        self._cut_dragging = False
+
+        if self.interactive_cuts_mode:
+            self.cuts_button.setText("Cuts ON")
+            self.cuts_button.setToolTip("Click and drag on the image to change contrast and level.")
+        else:
+            self.cuts_button.setText("Cuts OFF")
+            self.cuts_button.setToolTip("Enable interactive image cuts.")
+
+    def open_image_cuts_dialog(self):
+        """Open a small dialog to set vmin/vmax manually."""
+        if self.cube is None:
+            return
+
+        vmin, vmax = self.get_current_display_cuts()
+        if self.manual_image_cuts:
+            vmin = self.image_cut_vmin
+            vmax = self.image_cut_vmax
+
+        dialog = ImageCutsDialog(
+            parent=self,
+            vmin=vmin,
+            vmax=vmax,
+            auto_cuts=not self.manual_image_cuts,
+        )
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        auto_cuts, new_vmin, new_vmax = dialog.get_values()
+
+        if auto_cuts:
+            self.manual_image_cuts = False
+            self.image_cut_vmin = None
+            self.image_cut_vmax = None
+        else:
+            self.manual_image_cuts = True
+            self.image_cut_vmin = float(new_vmin)
+            self.image_cut_vmax = float(new_vmax)
+
+        self.update_image(keep_zoom=True)
+
+    def start_interactive_cuts(self, event):
+        """Store the starting point and cuts for an interactive drag."""
+        if self.cube is None or event.inaxes != self.image_ax:
+            return
+
+        vmin, vmax = self.get_current_display_cuts()
+        if vmin is None or vmax is None or vmin <= 0:
+            return
+
+        self._cut_dragging = True
+        self._cut_start_x = event.x
+        self._cut_start_y = event.y
+        self._cut_start_log_vmin = np.log10(vmin)
+        self._cut_start_log_vmax = np.log10(vmax)
+
+        self.manual_image_cuts = True
+        self.image_cut_vmin = vmin
+        self.image_cut_vmax = vmax
+
+    def update_interactive_cuts(self, event):
+        """Update image cuts while dragging, with a DS9-like feel."""
+        if not self._cut_dragging:
+            return
+
+        if event.x is None or event.y is None:
+            return
+
+        canvas_w = max(1.0, float(self.image_canvas.width()))
+        canvas_h = max(1.0, float(self.image_canvas.height()))
+
+        dx = (event.x - self._cut_start_x) / canvas_w
+        dy = (event.y - self._cut_start_y) / canvas_h
+
+        log_vmin0 = self._cut_start_log_vmin
+        log_vmax0 = self._cut_start_log_vmax
+        width0 = max(1e-6, log_vmax0 - log_vmin0)
+        center0 = 0.5 * (log_vmax0 + log_vmin0)
+
+        # Horizontal drag changes contrast; vertical drag shifts the level.
+        contrast_factor = 10.0 ** (-2.5 * dx)
+        width = np.clip(width0 * contrast_factor, 1e-6, 30.0)
+        center = center0 + 3.0 * dy * width0
+
+        log_vmin = center - 0.5 * width
+        log_vmax = center + 0.5 * width
+
+        vmin = 10.0 ** log_vmin
+        vmax = 10.0 ** log_vmax
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin <= 0 or vmax <= vmin:
+            return
+
+        self.image_cut_vmin = float(vmin)
+        self.image_cut_vmax = float(vmax)
+        self.manual_image_cuts = True
+
+        self.update_image(keep_zoom=True)
+
+    def stop_interactive_cuts(self, event):
+        """Stop the interactive cuts drag."""
+        self._cut_dragging = False
 
     def update_image(self, keep_zoom=True):
         if self.cube is None:
@@ -724,30 +1007,51 @@ class CubeViewer(QMainWindow):
 
         image = self.get_current_image()
 
+        if self.image_colorbar is not None:
+            try:
+                self.image_colorbar.remove()
+            except Exception:
+                pass
+            self.image_colorbar = None
+
         self.image_ax.clear()
-        
-        finite_positive = np.isfinite(image) & (image > 0)
 
-        if np.any(finite_positive):
-            vmax = np.nanmax(image[finite_positive])
-            positive_values = image[finite_positive]
+        if self.manual_image_cuts:
+            vmin = self.image_cut_vmin
+            vmax = self.image_cut_vmax
+        else:
+            vmin, vmax = self.get_auto_image_cuts(image)
 
-            vmin = np.nanmin(positive_values)
+        image_artist = None
 
-            if not np.isfinite(vmin) or vmin <= 0:
-                vmin = vmax * 1e-4
+        if vmin is not None and vmax is not None and np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin:
+            if vmin > 0:
+                norm = LogNorm(vmin=vmin, vmax=vmax)
+            else:
+                # LogNorm cannot show zero or negative values.
+                # If the user manually asks for negative cuts, we switch to linear.
+                norm = Normalize(vmin=vmin, vmax=vmax)
 
-            if vmin >= vmax:
-                vmin = 1e-4
-
-            self.image_ax.imshow(
+            image_artist = self.image_ax.imshow(
                 image,
                 origin="lower",
-                norm=LogNorm(vmin=vmin, vmax=vmax),
+                norm=norm,
             )
         else:
-            self.image_ax.imshow(image, origin="lower")
-            
+            image_artist = self.image_ax.imshow(image, origin="lower")
+
+        if image_artist is not None:
+            try:
+                self.image_colorbar = self.image_fig.colorbar(
+                    image_artist,
+                    ax=self.image_ax,
+                    fraction=0.046,
+                    pad=0.04,
+                )
+                self.image_colorbar.set_label("Flux / image value")
+            except Exception:
+                self.image_colorbar = None
+
         self.image_ax.set_xlabel("x [pix]")
         self.image_ax.set_ylabel("y [pix]")
 
@@ -795,6 +1099,15 @@ class CubeViewer(QMainWindow):
     
     def update_spectrum(self, keep_zoom=True):
         if self.cube is None:
+            return
+
+        if self.data_is_image:
+            self.spectrum_ax.clear()
+            self.spectrum_ax.set_title("2D FITS image loaded: no spectrum available")
+            self.spectrum_ax.set_xlabel("")
+            self.spectrum_ax.set_ylabel("")
+            self.spectrum_canvas.draw_idle()
+            self.update_current_values_label()
             return
 
         # Preserve only the spectral x range. The y range is always recomputed
@@ -883,6 +1196,12 @@ class CubeViewer(QMainWindow):
         if event.xdata is None or event.ydata is None:
             return
 
+        # When cuts mode is active, a click starts contrast/level editing
+        # instead of selecting a new source position.
+        if self.interactive_cuts_mode:
+            self.start_interactive_cuts(event)
+            return
+
         # Do not select a source while matplotlib zoom/pan is active.
         mode = self.image_toolbar.mode
         if mode:
@@ -914,6 +1233,14 @@ class CubeViewer(QMainWindow):
 
         self.update_current_values_label()
 
+    def on_image_motion(self, event):
+        if self.interactive_cuts_mode:
+            self.update_interactive_cuts(event)
+
+    def on_image_release(self, event):
+        if self.interactive_cuts_mode:
+            self.stop_interactive_cuts(event)
+
     def on_spectral_region_selected(self, xmin, xmax):
         if self.cube is None:
             return
@@ -944,7 +1271,7 @@ class CubeViewer(QMainWindow):
 
     def open_action_dialog(self, action_name):
         if self.cube_path is None:
-            QMessageBox.warning(self, "No cube", "Load a FITS cube first.")
+            QMessageBox.warning(self, "No FITS file", "Load a FITS image or cube first.")
             return
 
         if not self.cubex_root:
@@ -972,6 +1299,35 @@ class CubeViewer(QMainWindow):
             params["cube"] = self.cube_path
             params["SBmap"] = os.path.join(cube_dir, cube_root + "_sb.fits")
             params["KinMap"] = os.path.join(cube_dir, cube_root + "_kin.fits")
+
+            # If a 3D binary mask already exists in the same folder, use it to
+            # estimate a reasonable default velocity zero-point for the vmap.
+            mask3d_candidates = [
+                os.path.join(cube_dir, cube_root + ".Objects_Id.fits"),
+                os.path.join(cube_dir, cube_root + "_Objects_Id.fits"),
+                os.path.join(cube_dir, "Mask3D.fits"),
+                os.path.join(cube_dir, "mask3d.fits"),
+            ]
+
+            for mask3d in mask3d_candidates:
+                if not os.path.exists(mask3d):
+                    continue
+
+                params["mask3d"] = mask3d
+
+                try:
+                    estimated_vzero = self.estimate_vzero_from_mask(
+                        cube_path=self.cube_path,
+                        mask_path=mask3d,
+                        object_id=1,
+                    )
+
+                    params["vzero"] = f"{estimated_vzero:.3f}"
+
+                except Exception as exc:
+                    print(f"Could not estimate automatic vzero from {mask3d}: {exc}")
+
+                break
 
         if action_name == "CubePSFSub" and self.selected_x is not None and self.selected_y is not None:
             params["x"] = f"{self.selected_x:.2f}"
@@ -1051,6 +1407,8 @@ class CubeViewer(QMainWindow):
         self.table_button.setStyleSheet("font-size: 10px;")
         self.actions_button.setStyleSheet("font-size: 10px;")
         self.apply_region_button.setStyleSheet("font-size: 10px;")
+        self.cuts_button.setStyleSheet("font-size: 10px;")
+        self.manual_cuts_button.setStyleSheet("font-size: 10px;")
         self.cube_selector.setStyleSheet("font-size: 10px;")
         self.image_mode_combo.setStyleSheet("font-size: 10px;")
         self.aperture_radius_box.setStyleSheet("font-size: 10px;")
@@ -1114,6 +1472,87 @@ class CubeViewer(QMainWindow):
             
         
         
+class ImageCutsDialog(QDialog):
+    def __init__(self, parent=None, vmin=None, vmax=None, auto_cuts=True):
+        super().__init__(parent)
+
+        self.setWindowTitle("Image cuts / extrema")
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.auto_checkbox = QCheckBox("Auto cuts")
+        self.auto_checkbox.setChecked(auto_cuts)
+        self.auto_checkbox.stateChanged.connect(self.update_enabled_state)
+
+        self.vmin_box = QLineEdit("" if vmin is None else f"{vmin:.6g}")
+        self.vmax_box = QLineEdit("" if vmax is None else f"{vmax:.6g}")
+
+        form.addRow("Mode", self.auto_checkbox)
+        form.addRow("vmin", self.vmin_box)
+        form.addRow("vmax", self.vmax_box)
+
+        layout.addLayout(form)
+
+        note = QLabel(
+            "Manual vmin can be negative. If vmin <= 0, the image is shown with "
+            "a linear normalization; otherwise it uses log normalization."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size: 10px;")
+        layout.addWidget(note)
+
+        button_bar = QHBoxLayout()
+        ok_button = QPushButton("Apply")
+        ok_button.clicked.connect(self.accept_if_valid)
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        button_bar.addWidget(ok_button)
+        button_bar.addWidget(cancel_button)
+        layout.addLayout(button_bar)
+
+        self.update_enabled_state()
+
+    def update_enabled_state(self):
+        enabled = not self.auto_checkbox.isChecked()
+        self.vmin_box.setEnabled(enabled)
+        self.vmax_box.setEnabled(enabled)
+
+    def get_values(self):
+        auto_cuts = self.auto_checkbox.isChecked()
+
+        if auto_cuts:
+            return True, None, None
+
+        vmin = float(self.vmin_box.text().strip())
+        vmax = float(self.vmax_box.text().strip())
+
+        return False, vmin, vmax
+
+    def accept_if_valid(self):
+        if self.auto_checkbox.isChecked():
+            self.accept()
+            return
+
+        try:
+            _, vmin, vmax = self.get_values()
+        except Exception:
+            QMessageBox.warning(self, "Invalid cuts", "vmin and vmax must be numeric values.")
+            return
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            QMessageBox.warning(self, "Invalid cuts", "vmin and vmax must be finite values.")
+            return
+
+        if vmax <= vmin:
+            QMessageBox.warning(self, "Invalid cuts", "vmax must be larger than vmin.")
+            return
+
+        self.accept()
+
+
 class CubExActionDialog(QDialog):
     def __init__(self, parent, action_name, action_config, cube_path, cubex_root):
         super().__init__(parent)
@@ -1129,6 +1568,8 @@ class CubExActionDialog(QDialog):
         self.command_used = ""
         self.open_output_after_run = False
 
+        self.input_cube = None
+        self.output_file = None
         self.param_widgets = {}
 
         self.setWindowTitle(action_name)
@@ -1136,27 +1577,37 @@ class CubExActionDialog(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-
         form = QFormLayout()
 
-        self.input_cube = QLineEdit(self.cube_path)
-        form.addRow("Input cube", self.input_cube)
+        # Standard CubEx tools use the command-line form:
+        #     ToolName -cube input.fits -out output.fits ...
+        # For these tools we keep the generic input/output widgets.
+        # CubEx itself and special GUI workflows expose their own path parameters
+        # such as InpFile, input_image, mask3d, SBmap, and KinMap.
+        if self.uses_generic_input_output():
+            self.input_cube = QLineEdit(self.cube_path)
+            form.addRow("Input FITS", self._make_path_row(self.input_cube, mode="open"))
 
-        default_out = self.default_output_path()
-        self.output_file = QLineEdit(default_out)
-
-        if self.action_name != "CubEx":
-            form.addRow("Output file", self.output_file)
+            self.output_file = QLineEdit(self.default_output_path())
+            form.addRow("Output file", self._make_path_row(self.output_file, mode="save"))
 
         for key, value in self.action_config["params"].items():
             widget = QLineEdit(str(value))
             self.param_widgets[key] = widget
-            form.addRow(key, widget)
+
+            # Only true file/path parameters get a Browse button.
+            # Numeric CubEx parameters such as UnMask, MaskOnly, id, nl, etc.
+            # must remain plain text fields.
+            if self.is_path_parameter(key):
+                mode = "save" if self.is_output_path_parameter(key) else "open"
+                form.addRow(key, self._make_path_row(widget, mode=mode))
+            else:
+                form.addRow(key, widget)
 
         self.open_output_checkbox = QCheckBox("Open output after completion")
         self.open_output_checkbox.setChecked(True)
 
-        if self.action_name != "CubEx":
+        if self.uses_generic_input_output():
             form.addRow("", self.open_output_checkbox)
 
         layout.addLayout(form)
@@ -1186,6 +1637,152 @@ class CubExActionDialog(QDialog):
 
         self.update_command_preview()
 
+    def uses_generic_input_output(self):
+        """Return True for simple CubEx tools that need -cube and -out."""
+        return self.action_name != "CubEx" and not self.is_special_action()
+
+    def start_directory(self, line_edit=None):
+        """Start file dialogs from the most useful nearby folder."""
+        candidates = []
+
+        if line_edit is not None:
+            candidates.append(line_edit.text().strip())
+
+        if self.input_cube is not None:
+            candidates.append(self.input_cube.text().strip())
+
+        candidates.append(self.cube_path)
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+
+            if os.path.isdir(candidate):
+                return candidate
+
+            directory = os.path.dirname(candidate)
+            if directory and os.path.isdir(directory):
+                return directory
+
+        return os.getcwd()
+
+    def is_path_parameter(self, key):
+        """Decide whether a parameter should show a Browse button."""
+        k = key.lower()
+
+        # These fields may contain the word "mask" or "id", but they are numbers
+        # or lists of numbers, not paths. In particular, UnMask is a SourceMask ID.
+        non_browse_fields = {
+            "unmask",
+            "maskonly",
+            "selected_id",
+            "selected_ids",
+            "id",
+            "idpad",
+            "nl",
+            "nl2",
+            "nlpad",
+            "nlpad2",
+            "gsm",
+            "gsm2",
+            "vzero",
+            "zmin",
+            "zmax",
+            "lmin",
+            "lmax",
+            "x",
+            "y",
+            "rmin",
+            "rmax",
+            "zpsfsize",
+            "nbins",
+            "filterxyrad",
+            "filterzrad",
+            "sn_threshold",
+            "minnspax",
+            "minnvox",
+            "ncheckcubes",
+            "xyedge",
+            "aperradius",
+            "aperdz",
+        }
+
+        if k in non_browse_fields:
+            return False
+
+        # These names are expected to contain file paths. This intentionally
+        # includes masks, cubes, catalogues, maps, lists and variance files.
+        path_tokens = [
+            "file",
+            "cube",
+            "mask",
+            "map",
+            "catalogue",
+            "catalog",
+            "image",
+            "table",
+            "path",
+            "par",
+            "list",
+        ]
+
+        return any(token in k for token in path_tokens)
+
+    def is_output_path_parameter(self, key):
+        """Decide whether a path parameter should use a save dialog."""
+        k = key.lower()
+
+        output_tokens = [
+            "out",
+            "output",
+            "sbmap",
+            "kinmap",
+            "catalogue",
+            "catalog",
+            "rescalingvaroutfile",
+            "estvaroutfile",
+        ]
+
+        return any(token in k for token in output_tokens)
+
+    def _make_path_row(self, line_edit, mode="open"):
+        """Create a compact text field plus Browse button."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        browse_button = QPushButton("Browse")
+        browse_button.setFixedWidth(70)
+        browse_button.clicked.connect(lambda: self.browse_for_path(line_edit, mode=mode))
+
+        layout.addWidget(line_edit)
+        layout.addWidget(browse_button)
+
+        return row
+
+    def browse_for_path(self, line_edit, mode="open"):
+        """Open a file dialog and update the associated path field."""
+        start_dir = self.start_directory(line_edit)
+
+        if mode == "save":
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Select output file",
+                start_dir,
+                "FITS files (*.fits *.fit *.fz);;Catalogues (*.cat *.txt *.csv);;All files (*)",
+            )
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select input file",
+                start_dir,
+                "FITS files (*.fits *.fit *.fz);;Parameter/List files (*.par *.txt *.dat *.lst);;Catalogues (*.cat *.csv);;All files (*)",
+            )
+
+        if path:
+            line_edit.setText(path)
+            self.update_command_preview()
+
     def default_output_path(self):
         cube = self.cube_path
         root, ext = os.path.splitext(cube)
@@ -1208,8 +1805,7 @@ class CubExActionDialog(QDialog):
 
     def build_command(self):
         params = self.collect_params()
-        if self.is_special_action():
-            return []
+
         exe_rel = self.action_config["executable"]
 
         if exe_rel == "CubEx":
@@ -1219,8 +1815,13 @@ class CubExActionDialog(QDialog):
 
         if self.action_name == "CubEx":
             parfile = self.write_cubex_parameter_file(params)
-            cmd = [executable, parfile]
-            return cmd
+            return [executable, parfile]
+
+        if self.is_special_action():
+            return []
+
+        if self.input_cube is None or self.output_file is None:
+            raise ValueError(f"Missing input/output fields for action {self.action_name}")
 
         cmd = [
             executable,
@@ -1262,8 +1863,9 @@ class CubExActionDialog(QDialog):
 
             elif self.action_name == "Binarize3DMask":
                 txt = (
-                    f"Open {params.get('mask3d')} and set selected_id={params.get('selected_id')} "
-                    f"to 1, all other values to 0. File is overwritten."
+                    f"Open {params.get('mask3d')} and keep selected_ids="
+                    f"{params.get('selected_ids', params.get('selected_id'))}. "
+                    "Selected IDs become 1; all other values become 0."
                 )
 
             elif self.action_name == "CreateMaps":
@@ -1331,11 +1933,19 @@ class CubExActionDialog(QDialog):
             QMessageBox.critical(self, "CubEx error", msg)
             return
 
-        self.input_cube_path = self.input_cube.text().strip()
-        self.params_used = self.collect_params()
+        params_used = self.collect_params()
+
+        if self.action_name == "CubEx":
+            self.input_cube_path = params_used.get("InpFile", self.cube_path)
+        elif self.input_cube is not None:
+            self.input_cube_path = self.input_cube.text().strip()
+        else:
+            self.input_cube_path = self.cube_path
+
+        self.params_used = params_used
         self.command_used = cmd_txt
 
-        if self.action_name != "CubEx":
+        if self.uses_generic_input_output():
             self.output_path = self.output_file.text().strip()
             self.open_output_after_run = self.open_output_checkbox.isChecked()
         else:
@@ -1350,15 +1960,14 @@ class CubExActionDialog(QDialog):
 
         self.accept()
 
-    
     def write_cubex_parameter_file(self, params):
-        input_cube = self.input_cube.text().strip()
+        params = dict(params)
+
+        input_cube = params.get("InpFile", "").strip() or self.cube_path
         cube_dir = os.path.dirname(input_cube)
         cube_root = os.path.splitext(os.path.basename(input_cube))[0]
 
         par_path = os.path.join(cube_dir, f"{cube_root}_CubEx.par")
-
-        params = dict(params)
 
         if not params.get("InpFile", "").strip():
             params["InpFile"] = input_cube
@@ -1412,7 +2021,7 @@ class CubExActionDialog(QDialog):
 
         with open(par_path, "w") as f:
             f.write("# CubEx parameter file generated by AutomatiCubEx\n")
-            f.write("# This file was generated from the GUI.\n\n")
+            f.write("# This file was generated from the GUI so the run can be repeated.\n\n")
 
             for key, value in params.items():
                 value = str(value).strip()
@@ -1431,6 +2040,7 @@ class CubExActionDialog(QDialog):
 
         self.generated_parfile = par_path
         return par_path
+
     def run_special_action(self):
         params = self.collect_params()
 
@@ -1533,17 +2143,38 @@ class CubExActionDialog(QDialog):
             ])
         )
 
+    def parse_selected_ids(self, selected_ids_text):
+        """Parse a comma/space-separated list of CubEx object IDs."""
+        text = str(selected_ids_text).strip()
+
+        if not text:
+            raise ValueError("selected_ids is empty.")
+
+        tokens = text.replace(",", " ").split()
+        values = []
+
+        for token in tokens:
+            try:
+                values.append(float(token))
+            except ValueError:
+                raise ValueError(
+                    f"Invalid selected ID: {token}. "
+                    "Use values separated by commas or spaces, e.g. 33,56,98."
+                )
+
+        if len(values) == 0:
+            raise ValueError("No valid selected IDs were provided.")
+
+        return np.asarray(values, dtype=float)
+
     def run_binarize_3d_mask(self, params):
         mask3d = params["mask3d"].strip()
-        selected_id = params["selected_id"].strip()
+        selected_ids_text = params.get("selected_ids", params.get("selected_id", "")).strip()
 
         if not mask3d:
             raise ValueError("mask3d is empty.")
 
-        if not selected_id:
-            raise ValueError("selected_id is empty.")
-
-        selected_id = float(selected_id)
+        selected_ids = self.parse_selected_ids(selected_ids_text)
 
         with fits.open(mask3d, mode="update", memmap=False) as hdul:
             hdu_index = None
@@ -1557,11 +2188,16 @@ class CubExActionDialog(QDialog):
                 raise ValueError(f"No 3D image found in {mask3d}")
 
             data = hdul[hdu_index].data
-            hdul[hdu_index].data = np.where(data == selected_id, 1, 0).astype(np.int16)
+
+            # Keep only the selected labels. This is intentionally destructive:
+            # the original Objects_Id cube is converted into a clean binary mask.
+            mask = np.isin(data, selected_ids)
+            hdul[hdu_index].data = np.where(mask, 1, 0).astype(np.int16)
             hdul.flush()
 
+        selected_ids_string = ",".join(f"{value:g}" for value in selected_ids)
         self.command_preview.setText(
-            f"Binarized {mask3d}: value {selected_id:g} -> 1, all other values -> 0"
+            f"Binarized {mask3d}: values {selected_ids_string} -> 1, all other values -> 0"
         )
 
     def run_create_maps(self, params):
@@ -1622,10 +2258,10 @@ class CubExActionDialog(QDialog):
 
         print("\n========== CreateMaps ==========")
         print(" ".join(shlex.quote(x) for x in cmd_sb))
-        subprocess.run(cmd_sb,check=True,cwd=os.path.dirname(cube))
+        subprocess.run(cmd_sb, check=True, cwd=os.path.dirname(cube))
 
         print(" ".join(shlex.quote(x) for x in cmd_kin))
-        subprocess.run(cmd_kin,check=True,cwd=os.path.dirname(cube))
+        subprocess.run(cmd_kin, check=True, cwd=os.path.dirname(cube))
 
         self.command_preview.setText(
             " ; ".join([
@@ -1633,7 +2269,6 @@ class CubExActionDialog(QDialog):
                 " ".join(shlex.quote(x) for x in cmd_kin),
             ])
         )
-
 
 
 if __name__ == "__main__":
