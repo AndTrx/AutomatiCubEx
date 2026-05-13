@@ -1,0 +1,45 @@
+# ============================================================
+# AutomatiCubEx - requirements.txt
+# ============================================================
+#
+# Install with:
+#
+#   pip install -r requirements.txt
+#
+# or with conda:
+#
+#   conda install --file requirements.txt
+#
+# ============================================================
+# IMPORTANT:
+#
+# AutomatiCubEx requires CubEx/CubExtractor.
+#
+# CubEx is NOT distributed through pip or conda.
+# Users must install CubEx separately.
+#
+# To obtain CubEx, contact:
+#
+#   sebastiano.cantalupo@unimib.it
+#
+# After installation, compile CubEx and provide the
+# CubEx root directory inside AutomatiCubEx.
+#
+# Typical structure:
+#
+#   CubEx-master/
+#       CubEx
+#       Tools/
+#           Cube2Im
+#           CubePSFSub
+#           CubeBKGSub
+#           CubeSel
+#           ...
+#
+# ============================================================
+
+numpy
+scipy
+matplotlib
+astropy
+PySide6

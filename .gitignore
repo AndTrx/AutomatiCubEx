@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+
+# FITS files
+*.fits
+
+# Logs
+*.log
+
+# CSV registries
+*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv
+
+# Temporary
+tmp/
+temp/
