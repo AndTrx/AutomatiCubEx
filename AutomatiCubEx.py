@@ -233,6 +233,7 @@ class CubeViewer(QMainWindow):
         self.image_ylim = None
         self.spectrum_xlim = None
         self.spectrum_ylim = None
+        self.lock_spectrum_ylim = False
 
         # Display cuts for the image viewer.
         # The user can either keep automatic cuts, set them manually, or adjust them
@@ -334,10 +335,15 @@ class CubeViewer(QMainWindow):
 
         self.z_label = QLabel("z = 0")
 
+        self.lock_ylim_button = QPushButton("Lock ylim OFF")
+        self.lock_ylim_button.setCheckable(True)
+        self.lock_ylim_button.clicked.connect(self.toggle_spectrum_ylim_lock)
+
         z_bar = QHBoxLayout()
         z_bar.addWidget(QLabel("Spectral slice"))
         z_bar.addWidget(self.z_slider)
         z_bar.addWidget(self.z_label)
+        z_bar.addWidget(self.lock_ylim_button)
 
         self.spectrum_fig = Figure(figsize=(9, 2.8), constrained_layout=True)
         self.spectrum_canvas = FigureCanvas(self.spectrum_fig)
@@ -346,6 +352,7 @@ class CubeViewer(QMainWindow):
 
         self.spectrum_ax.callbacks.connect("xlim_changed", self.on_spectrum_limits_changed)
         self.spectrum_ax.callbacks.connect("ylim_changed", self.on_spectrum_limits_changed)
+        
 
         self.span_selector = SpanSelector(
             self.spectrum_ax,
@@ -499,6 +506,18 @@ class CubeViewer(QMainWindow):
         self.registry_table_path = path
         self.analysis_name = analysis_name
         self.table_label.setText(f"Action table: {path}\nAnalysis: {analysis_name}")
+    
+    def toggle_spectrum_ylim_lock(self):
+        self.lock_spectrum_ylim = self.lock_ylim_button.isChecked()
+
+        if self.lock_spectrum_ylim:
+            self.spectrum_ylim = self.spectrum_ax.get_ylim()
+            self.lock_ylim_button.setText("Lock ylim ON")
+        else:
+            self.lock_ylim_button.setText("Lock ylim OFF")
+            self.spectrum_ylim = None
+
+        self.update_spectrum(keep_zoom=True)
 
     def get_existing_analysis_names(self, table_path):
         """Read existing analysis names from the CSV registry, if any.
@@ -1261,33 +1280,52 @@ class CubeViewer(QMainWindow):
         if keep_zoom and xlim is not None:
             self.spectrum_ax.set_xlim(xlim)
 
-            xmin, xmax = xlim
+        # If ylim is locked, preserve the current y range exactly.
+        if self.lock_spectrum_ylim and self.spectrum_ylim is not None:
+
+            self.spectrum_ax.set_ylim(self.spectrum_ylim)
+
+        else:
+
+            xmin, xmax = self.spectrum_ax.get_xlim()
+
             xlo = min(xmin, xmax)
             xhi = max(xmin, xmax)
 
-            visible = (xaxis >= xlo) & (xaxis <= xhi) & np.isfinite(spectrum)
+            visible = (
+                (xaxis >= xlo)
+                & (xaxis <= xhi)
+                & np.isfinite(spectrum)
+            )
 
             if np.any(visible):
+
                 ymin = np.nanmin(spectrum[visible])
                 ymax = np.nanmax(spectrum[visible])
 
                 if np.isfinite(ymin) and np.isfinite(ymax):
+
                     if ymin == ymax:
                         pad = 0.1 * abs(ymax) if ymax != 0 else 1.0
                     else:
                         pad = 0.08 * (ymax - ymin)
 
-                    self.spectrum_ax.set_ylim(ymin - pad, ymax + pad)
-                    self.spectrum_ylim = self.spectrum_ax.get_ylim()
-            else:
-                self.spectrum_ax.relim()
-                self.spectrum_ax.autoscale_view(scalex=False, scaley=True)
-                self.spectrum_ylim = self.spectrum_ax.get_ylim()
+                    self.spectrum_ax.set_ylim(
+                        ymin - pad,
+                        ymax + pad,
+                    )
 
-        else:
-            self.spectrum_ax.relim()
-            self.spectrum_ax.autoscale_view(scalex=True, scaley=True)
-            self.spectrum_ylim = self.spectrum_ax.get_ylim()
+                    self.spectrum_ylim = self.spectrum_ax.get_ylim()
+
+            else:
+
+                self.spectrum_ax.relim()
+                self.spectrum_ax.autoscale_view(
+                    scalex=False,
+                    scaley=True,
+                )
+
+                self.spectrum_ylim = self.spectrum_ax.get_ylim()
 
         self.spectrum_canvas.draw_idle()
         self.update_current_values_label()
@@ -1519,6 +1557,7 @@ class CubeViewer(QMainWindow):
         self.cube_selector.setStyleSheet("font-size: 10px;")
         self.image_mode_combo.setStyleSheet("font-size: 10px;")
         self.aperture_radius_box.setStyleSheet("font-size: 10px;")
+        self.lock_ylim_button.setStyleSheet("font-size: 10px;")
     
     def save_action_to_registry(self, action_name, input_cube, output_cube, params, command):
         if self.registry_table_path is None:
