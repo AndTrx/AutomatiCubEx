@@ -1256,13 +1256,38 @@ class CubeViewer(QMainWindow):
 
             self.spectrum_ax.axvspan(x1, x2, alpha=0.2)
 
-        # Restore only the spectral x zoom. Then autoscale y to show the full spectrum.
+        # Restore only the spectral x zoom.
+        # The y range is computed only from the data visible inside the current x range.
         if keep_zoom and xlim is not None:
             self.spectrum_ax.set_xlim(xlim)
 
-        self.spectrum_ax.relim()
-        self.spectrum_ax.autoscale_view(scalex=False, scaley=True)
-        self.spectrum_ylim = self.spectrum_ax.get_ylim()
+            xmin, xmax = xlim
+            xlo = min(xmin, xmax)
+            xhi = max(xmin, xmax)
+
+            visible = (xaxis >= xlo) & (xaxis <= xhi) & np.isfinite(spectrum)
+
+            if np.any(visible):
+                ymin = np.nanmin(spectrum[visible])
+                ymax = np.nanmax(spectrum[visible])
+
+                if np.isfinite(ymin) and np.isfinite(ymax):
+                    if ymin == ymax:
+                        pad = 0.1 * abs(ymax) if ymax != 0 else 1.0
+                    else:
+                        pad = 0.08 * (ymax - ymin)
+
+                    self.spectrum_ax.set_ylim(ymin - pad, ymax + pad)
+                    self.spectrum_ylim = self.spectrum_ax.get_ylim()
+            else:
+                self.spectrum_ax.relim()
+                self.spectrum_ax.autoscale_view(scalex=False, scaley=True)
+                self.spectrum_ylim = self.spectrum_ax.get_ylim()
+
+        else:
+            self.spectrum_ax.relim()
+            self.spectrum_ax.autoscale_view(scalex=True, scaley=True)
+            self.spectrum_ylim = self.spectrum_ax.get_ylim()
 
         self.spectrum_canvas.draw_idle()
         self.update_current_values_label()
@@ -1456,10 +1481,13 @@ class CubeViewer(QMainWindow):
                 command=command_used,
             )
 
-            if out_path and os.path.exists(out_path) and out_path.lower().endswith(".fits"):
-                self.add_loaded_file(out_path)
-
-                if dialog.open_output_after_run:
+            if (
+                    dialog.open_output_after_run
+                    and out_path
+                    and os.path.exists(out_path)
+                    and out_path.lower().endswith(".fits")
+                ):
+                    self.add_loaded_file(out_path)
                     self.load_cube(out_path, add_to_list=True, reset_zoom=True)
     
     def compact_right_panel_text(self):
